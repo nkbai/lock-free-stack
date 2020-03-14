@@ -1,88 +1,73 @@
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{spin_loop_hint, AtomicPtr};
-
-struct Node {
+use std::sync::atomic::{spin_loop_hint};
+extern crate crossbeam_epoch as epoch;
+use epoch::{Atomic, Owned, Shared};
+pub struct Node {
     value: i32,
-    next: *mut Node,
+    next: *const Node,
 }
-struct LockFreeStack {
-    next: AtomicPtr<Node>,
+pub struct LockFreeStack {
+    next: Atomic<Node>,
 }
 unsafe impl Sync for LockFreeStack {}
 unsafe impl Send for LockFreeStack {}
 impl LockFreeStack {
     pub fn new() -> LockFreeStack {
         LockFreeStack {
-            next: AtomicPtr::new(std::ptr::null_mut()),
+            next: Atomic::null(),
         }
     }
     pub fn push(&self, v: i32) {
-        /*
-        这里的Ordering应该是什么呢?
-        */
-        let mut old = self.next.load(std::sync::atomic::Ordering::Relaxed);
-        let   new = Box::new(Node {
+
+        let guard = epoch::pin();
+
+        let   mut new = Owned::new(Node {
             value: v,
-            next: old,
+            next: std::ptr::null(),
         });
-        let new = Box::into_raw(new);
         loop {
+            let   old = self.next.load(Ordering::Relaxed,&guard);
+            new.next=old.as_raw();
             /*
             这里的Ordering应该是什么呢?
             */
-            let prev = self.next.compare_and_swap(old, new, Ordering::AcqRel);
-            if prev == old {
-                break;
-            }
-            /*
-            毫无疑问,这里是safe的,因为还在new的作用域中,一定没有被释放.
-            并且,走到这里说明这个节点还没有加入stack,所以也不存在被pop的可能性.
-            */
-            unsafe {
-                (*new).next = prev;
-            }
-            old = prev;
-            spin_loop_hint();
+            match  self.next.compare_and_set(old, new, Ordering::Release,&guard){
+                Ok(_)=>break,
+                Err(e)=>{
+                    new=e.new;
+                    spin_loop_hint();
+                },
+            };
         }
     }
     pub fn pop(&self) -> Option<i32> {
-        let mut old = self.next.load(std::sync::atomic::Ordering::Relaxed);
+        let guard = epoch::pin();
         loop {
-            if old.is_null() {
-                return None;
-            }
+            let   old = self.next.load(std::sync::atomic::Ordering::Acquire,&guard);
             /*
-            关于(*old).next 这个unsafe代码,
-            如果cas不成功,那么这里可能取到一个无效的指针,但是因为并不会使用,所以不会出现问题.
-            如果cas成功,那么(*old).next一定是安全有效的
-
-            问题的关键是这里有ABA问题, https://en.wikipedia.org/wiki/ABA_problem
-            所有没有gc的系统在lock-free编程的是一定要考虑这个问题,具体来说就是
-            假设A,B两个线程, 初始stack是a->b->c
-            这是A要pop,那么得到a,这时候a.next=b,
-            然后切换到B pop a, pop b,push d 但是不巧这时候d的地址用得就是a的地址 所以stack里面是d->c
-            然后切换到A,这时候A看到栈顶地址和自己取到的是一样的(a的地址),然后就把栈顶设置为a.next,也就是b
-            但是这时候b已经被释放了.
+            按照as_ref的文档说明,old的load不能是Relaxed,只要确保old的写的另一方是Release,就是安全的
+            我们这里无论是Push还是Pop对于old的set访问用得都是Release,因此是安全的.
             */
-            let prev = self
-                .next
-                .compare_and_swap(old, unsafe { (*old).next }, Ordering::AcqRel);
-            if prev == old {
-                if prev.is_null() {
-                    return None;
-                } else {
-                    /*
-                    这会释放申请的内存,
-                    关于unsafe:
-                    如果stack并发保护有效,那么拿到的prev指针有定是有效的,其他人也不会拿到.
-                    所以不存在二次释放的问题
-                    */
-                    let prev = unsafe { Box::from_raw(prev) };
-                    return Some(prev.value);
+            match unsafe{old.as_ref()}{
+                None=>return None,
+                Some(old2)=>{
+                    let next=old2.next;
+
+                    if self.next.compare_and_set(old, Shared::from(next),Ordering::Release,&guard).is_ok(){
+                        unsafe {
+                            /*
+                            按照defer_destroy文档,只要我们保证old不会再其他线程使用就是安全的
+                            而我们非常确信,这个old不会被其他线程使用,
+                            因为这里是defer_destroy,所以解决了ABA问题 (https://en.wikipedia.org/wiki/ABA_problem)
+                            */
+                            guard.defer_destroy(old);
+                        }
+                        return Some(old2.value);
+                    }
+                    spin_loop_hint();
                 }
             }
-            old = prev;
-            spin_loop_hint();
+
         }
     }
 }
@@ -91,21 +76,22 @@ impl Drop for LockFreeStack {
      因为&mut self保证了不会有其他人同时操作这个Stack,因此可以放心的一个一个移除即可.
     */
     fn drop(&mut self) {
-        let mut next = self.next.load(Ordering::Relaxed);
+        let guard = epoch::pin();
+        let mut next = self.next.load(Ordering::Relaxed,&guard).as_raw() as *mut Node;
         while !next.is_null() {
             /*
-            因为是独占,所以只要里面的原始数据是有效的,那么这里一定是安全的.
+            这里的next确定是通过Owned分配的,所以没有安全问题
+            并且drop持有的是mutable stack,只有一个线程可以访问,所以也没有并发问题.
             */
-            let n = unsafe { Box::from_raw(next) };
+            let n = unsafe { Owned::from_raw(next) };
             // println!("drop {}", n.value);
-            next = n.next;
+            next = n.next as *mut  Node ;
         }
     }
 }
 
 mod tests {
     use super::*;
-
     #[test]
     fn test_lock_free_stack() {
         let   s = LockFreeStack::new();
@@ -190,7 +176,7 @@ mod tests {
         use crossbeam_utils::sync::WaitGroup;
         use std::sync::{Arc, Barrier, Mutex};
         use std::thread;
-        let num:usize =100*1000;
+        let num:usize =1000;
         let mut v: Vec<i32> = (0..100*num as i32 ).collect();
         let mut start = 0;
 
