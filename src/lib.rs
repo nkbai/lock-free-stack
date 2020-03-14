@@ -55,6 +55,14 @@ impl LockFreeStack {
             关于(*old).next 这个unsafe代码,
             如果cas不成功,那么这里可能取到一个无效的指针,但是因为并不会使用,所以不会出现问题.
             如果cas成功,那么(*old).next一定是安全有效的
+
+            问题的关键是这里有ABA问题, https://en.wikipedia.org/wiki/ABA_problem
+            所有没有gc的系统在lock-free编程的是一定要考虑这个问题,具体来说就是
+            假设A,B两个线程, 初始stack是a->b->c
+            这是A要pop,那么得到a,这时候a.next=b,
+            然后切换到B pop a, pop b,push d 但是不巧这时候d的地址用得就是a的地址 所以stack里面是d->c
+            然后切换到A,这时候A看到栈顶地址和自己取到的是一样的(a的地址),然后就把栈顶设置为a.next,也就是b
+            但是这时候b已经被释放了.
             */
             let prev = self
                 .next
