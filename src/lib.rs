@@ -40,6 +40,9 @@ impl LockFreeStack {
             };
         }
     }
+    /*
+    因为用了自定义的gc,严格意义来说已经不是lock-free了.
+    */
     pub fn pop(&self) -> Option<i32> {
         let guard = epoch::pin();
         loop {
