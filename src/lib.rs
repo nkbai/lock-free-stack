@@ -1,5 +1,4 @@
 use std::sync::atomic::Ordering;
-use std::sync::atomic::{spin_loop_hint};
 extern crate crossbeam_epoch as epoch;
 use epoch::{Atomic, Owned, Shared};
 pub struct Node {
@@ -28,9 +27,6 @@ impl LockFreeStack {
         loop {
             let   old = self.next.load(Ordering::Relaxed,&guard);
             new.next=old.as_raw();
-            /*
-            这里的Ordering应该是什么呢?
-            */
             match  self.next.compare_and_set(old, new, Ordering::Release,&guard){
                 Ok(_)=>break,
                 Err(e)=>{
@@ -64,7 +60,7 @@ impl LockFreeStack {
                         }
                         return Some(old2.value);
                     }
-                    spin_loop_hint();
+                    // spin_loop_hint();
                 }
             }
 
